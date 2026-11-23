@@ -1,0 +1,6 @@
+{
+  "name": "俄羅斯方塊",
+  "description": "經典現代規範俄羅斯方塊遊戲，支援 SRS 旋轉踢牆、暫存方塊、幽靈預覽與 Web Audio 合成音效。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
