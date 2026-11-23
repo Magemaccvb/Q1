@@ -1,17 +1,34 @@
 export type TetrominoType = 'I' | 'O' | 'T' | 'S' | 'Z' | 'J' | 'L';
 
+export type SpecialAttribute = 'fire' | 'ice' | 'lightning';
+export type BlockAttribute = 'normal' | SpecialAttribute;
+
 export type RotationState = 0 | 1 | 2 | 3;
 
 export type GameStatus = 'TITLE_MENU' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
+
+export interface QueuePiece {
+  type: TetrominoType;
+  specialCellIndex: number | null;
+  specialAttr: SpecialAttribute | null;
+}
 
 export interface ActivePiece {
   type: TetrominoType;
   x: number;
   y: number;
   rotation: RotationState;
+  specialCellIndex: number | null;
+  specialLocalPos: [number, number] | null;
+  specialAttr: SpecialAttribute | null;
 }
 
-export type CellValue = TetrominoType | null;
+export interface BoardCell {
+  type: TetrominoType;
+  attr: BlockAttribute;
+}
+
+export type CellValue = BoardCell | null;
 export type BoardGrid = CellValue[][];
 
 export const BOARD_COLS = 10;
@@ -22,6 +39,46 @@ export const BOARD_TOTAL_ROWS = BOARD_VISIBLE_ROWS + BOARD_BUFFER_ROWS;
 export const LOCK_DELAY_MS = 500;
 export const MAX_LOCK_RESETS = 15;
 export const LINE_CLEAR_FLASH_MS = 160;
+export const FREEZE_BASE_MS = 6000;
+export const FREEZE_STACK_MS = 2500;
+export const FREEZE_MAX_MS = 10000;
+
+export const ATTRIBUTE_META: Record<
+  SpecialAttribute,
+  {
+    name: string;
+    shortName: string;
+    description: string;
+    accent: string;
+    glow: string;
+    rim: string;
+  }
+> = {
+  fire: {
+    name: '烈焰方塊',
+    shortName: '爆破',
+    description: '相連或消行引爆 3×3 範圍',
+    accent: '#FB7185',
+    glow: 'rgba(249, 115, 22, 0.85)',
+    rim: '#FED7AA',
+  },
+  ice: {
+    name: '寒冰方塊',
+    shortName: '凍結',
+    description: '相連或消行凍結重力 6 秒',
+    accent: '#38BDF8',
+    glow: 'rgba(56, 189, 248, 0.85)',
+    rim: '#E0F2FE',
+  },
+  lightning: {
+    name: '雷電方塊',
+    shortName: '貫穿',
+    description: '相連或消行消除整條縱行',
+    accent: '#FACC15',
+    glow: 'rgba(250, 204, 21, 0.88)',
+    rim: '#FEF9C3',
+  },
+};
 
 export const PIECE_PALETTE: Record<
   TetrominoType,

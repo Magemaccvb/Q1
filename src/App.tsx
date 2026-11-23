@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   ChevronsDown,
+  Flame,
   Flower2,
   Keyboard,
   Leaf,
@@ -21,17 +22,21 @@ import {
   Sun,
   Volume2,
   VolumeX,
+  Zap,
 } from 'lucide-react';
 import { PiecePreview } from './components/PiecePreview';
 import { SEASONS, SeasonBackdrop } from './components/SeasonBackdrop';
 import {
+  CascadeFallFxEvent,
   HardDropFxEvent,
   LineClearFxEvent,
+  SpecialFxEvent,
   TetrisBoard,
 } from './components/TetrisBoard';
 import { SeasonId, soundEngine } from './game/soundEffects';
 import {
   calculateLineScore,
+  collapseBoardColumns,
   createEmptyBoard,
   createSpawnPiece,
   detectTSpin,
@@ -42,19 +47,25 @@ import {
   isValidPosition,
   lockPieceToBoard,
   removeClearedRows,
+  resolveSpecialEffects,
+  SpecialResolution,
+  toQueuePiece,
   tryRotatePiece,
 } from './game/tetrisEngine';
 import {
   ActivePiece,
+  ATTRIBUTE_META,
   BOARD_COLS,
   BOARD_VISIBLE_ROWS,
   BoardGrid,
+  FREEZE_MAX_MS,
   GameStatus,
   LINE_CLEAR_FLASH_MS,
   LOCK_DELAY_MS,
   MAX_LOCK_RESETS,
   PIECE_PALETTE,
-  TetrominoType,
+  QueuePiece,
+  SpecialAttribute,
 } from './game/tetrisTypes';
 
 const HIGH_SCORE_KEY = 'tetris_tw_highscore_v1';
@@ -67,9 +78,10 @@ interface EngineState {
   status: GameStatus;
   board: BoardGrid;
   activePiece: ActivePiece | null;
-  holdPiece: TetrominoType | null;
+  holdPiece: QueuePiece | null;
   canHold: boolean;
-  queue: TetrominoType[];
+  queue: QueuePiece[];
+  attributeMode: boolean;
   score: number;
   highScore: number;
   startLevel: number;
@@ -79,6 +91,14 @@ interface EngineState {
   isBackToBack: boolean;
   clearingRows: number[];
   clearFlashTimer: number;
+  pendingCascade: {
+    settledBoard: BoardGrid;
+    movedSpecialCells: Array<{ x: number; y: number; attr: SpecialAttribute }>;
+    elapsedMs: number;
+    durationMs: number;
+    depth: number;
+  } | null;
+  needsCascadeAfterClear: boolean;
   gravityTimer: number;
   lockTimer: number;
   lockResets: number;
@@ -88,6 +108,10 @@ interface EngineState {
   calloutText: string;
   calloutPoints: number;
   calloutTimer: number;
+  elapsedMs: number;
+  tSpinCount: number;
+  freezeRemainingMs: number;
+  specialTriggerCount: number;
 }
 
 interface UiSnapshot {
@@ -95,9 +119,10 @@ interface UiSnapshot {
   board: BoardGrid;
   activePiece: ActivePiece | null;
   ghostY: number | null;
-  holdPiece: TetrominoType | null;
+  holdPiece: QueuePiece | null;
   canHold: boolean;
-  nextPieces: TetrominoType[];
+  nextPieces: QueuePiece[];
+  attributeMode: boolean;
   score: number;
   highScore: number;
   startLevel: number;
@@ -108,6 +133,10 @@ interface UiSnapshot {
   clearingRows: number[];
   calloutText: string;
   calloutPoints: number;
+  elapsedMs: number;
+  tSpinCount: number;
+  freezeRemainingMs: number;
+  specialTriggerCount: number;
 }
 
 function loadHighScore(): number {
@@ -128,16 +157,19 @@ function saveHighScore(score: number) {
   }
 }
 
-function ensureQueue(queue: TetrominoType[]): TetrominoType[] {
+function ensureQueue(queue: QueuePiece[], attributeMode: boolean): QueuePiece[] {
   const next = [...queue];
   while (next.length < 7) {
-    next.push(...generateBag());
+    next.push(...generateBag(attributeMode));
   }
   return next;
 }
 
-function createInitialEngineState(startLevel = 1): EngineState {
-  const queue = ensureQueue([]);
+function createInitialEngineState(
+  startLevel = 1,
+  attributeMode = true
+): EngineState {
+  const queue = ensureQueue([], attributeMode);
   return {
     status: 'TITLE_MENU',
     board: createEmptyBoard(),
@@ -145,6 +177,7 @@ function createInitialEngineState(startLevel = 1): EngineState {
     holdPiece: null,
     canHold: true,
     queue,
+    attributeMode,
     score: 0,
     highScore: loadHighScore(),
     startLevel,
@@ -154,6 +187,8 @@ function createInitialEngineState(startLevel = 1): EngineState {
     isBackToBack: false,
     clearingRows: [],
     clearFlashTimer: 0,
+    pendingCascade: null,
+    needsCascadeAfterClear: false,
     gravityTimer: 0,
     lockTimer: 0,
     lockResets: 0,
@@ -163,7 +198,18 @@ function createInitialEngineState(startLevel = 1): EngineState {
     calloutText: '',
     calloutPoints: 0,
     calloutTimer: 0,
+    elapsedMs: 0,
+    tSpinCount: 0,
+    freezeRemainingMs: 0,
+    specialTriggerCount: 0,
   };
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = totalSeconds % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
 function toSnapshot(state: EngineState): UiSnapshot {
@@ -180,6 +226,7 @@ function toSnapshot(state: EngineState): UiSnapshot {
     holdPiece: state.holdPiece,
     canHold: state.canHold,
     nextPieces: state.queue.slice(0, 3),
+    attributeMode: state.attributeMode,
     score: state.score,
     highScore: state.highScore,
     startLevel: state.startLevel,
@@ -190,6 +237,10 @@ function toSnapshot(state: EngineState): UiSnapshot {
     clearingRows: state.clearingRows,
     calloutText: state.calloutTimer > 0 ? state.calloutText : '',
     calloutPoints: state.calloutTimer > 0 ? state.calloutPoints : 0,
+    elapsedMs: state.elapsedMs,
+    tSpinCount: state.tSpinCount,
+    freezeRemainingMs: state.freezeRemainingMs,
+    specialTriggerCount: state.specialTriggerCount,
   };
 }
 
@@ -208,7 +259,7 @@ function TetrominoMark({ className = 'w-6 h-6' }: { className?: string }) {
 
 function KeyCap({ children }: { children: string }) {
   return (
-    <kbd className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 font-mono text-[11px] font-medium text-slate-200 bg-[#222631] border border-white/12 border-b-2 border-b-black/60 rounded shadow-sm">
+    <kbd className="inline-flex items-center justify-center min-w-[24px] px-1.5 py-0.5 font-mono text-[11px] font-medium text-slate-100 bg-black/40 rounded shadow-sm">
       {children}
     </kbd>
   );
@@ -234,14 +285,16 @@ export default function App() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [hardDropFx, setHardDropFx] = useState<HardDropFxEvent | null>(null);
   const [lineClearFx, setLineClearFx] = useState<LineClearFxEvent | null>(null);
+  const [specialFx, setSpecialFx] = useState<SpecialFxEvent | null>(null);
+  const [cascadeFallFx, setCascadeFallFx] = useState<CascadeFallFxEvent | null>(null);
   const [impactEffect, setImpactEffect] = useState<{
     id: number;
-    kind: 'tetris' | 'gameover';
+    kind: 'tetris' | 'gameover' | 'special';
   } | null>(null);
   const fxIdRef = useRef(1);
   const impactTimeoutRef = useRef<number | null>(null);
 
-  const triggerImpact = useCallback((kind: 'tetris' | 'gameover') => {
+  const triggerImpact = useCallback((kind: 'tetris' | 'gameover' | 'special') => {
     fxIdRef.current += 1;
     setImpactEffect({ id: fxIdRef.current, kind });
     if (impactTimeoutRef.current !== null) {
@@ -254,6 +307,7 @@ export default function App() {
   }, []);
 
   const currentSeason = SEASONS[seasonIndex];
+  const seasonTheme = currentSeason.theme;
 
   useEffect(() => {
     soundEngine.setSeason(currentSeason.id);
@@ -394,11 +448,11 @@ export default function App() {
 
   const spawnNextPiece = useCallback(
     (state: EngineState) => {
-      state.queue = ensureQueue(state.queue);
-      const nextType = state.queue.shift()!;
-      state.queue = ensureQueue(state.queue);
+      state.queue = ensureQueue(state.queue, state.attributeMode);
+      const nextItem = state.queue.shift()!;
+      state.queue = ensureQueue(state.queue, state.attributeMode);
 
-      const spawned = createSpawnPiece(nextType);
+      const spawned = createSpawnPiece(nextItem);
       state.gravityTimer = 0;
       state.lockTimer = 0;
       state.lockResets = 0;
@@ -425,6 +479,196 @@ export default function App() {
     [triggerImpact, updateHighScoreIfNeeded]
   );
 
+  const applySpecialResult = useCallback(
+    (state: EngineState, specialRes: SpecialResolution) => {
+      state.board = specialRes.nextBoard;
+      state.score += specialRes.bonusPoints;
+      state.specialTriggerCount += specialRes.triggeredCount;
+
+      if (specialRes.freezeAddMs > 0) {
+        state.freezeRemainingMs = Math.min(
+          FREEZE_MAX_MS,
+          state.freezeRemainingMs + specialRes.freezeAddMs
+        );
+        soundEngine.freeze();
+      }
+      if (specialRes.explosions.length > 0) {
+        soundEngine.explode(specialRes.triggeredCount - 1);
+      }
+      if (specialRes.lightnings.length > 0) {
+        const hasCross = specialRes.lightnings.some((l) => l.cross);
+        soundEngine.lightning(hasCross);
+      }
+      if (specialRes.triggeredCount >= 2) {
+        soundEngine.linkChain(specialRes.triggeredCount);
+      }
+
+      fxIdRef.current += 1;
+      setSpecialFx({
+        id: fxIdRef.current,
+        explosions: specialRes.explosions,
+        lightnings: specialRes.lightnings,
+        freezes: specialRes.freezes,
+        linkArcs: specialRes.linkArcs,
+        destroyedParticles: specialRes.destroyedParticles,
+      });
+
+      if (
+        specialRes.explosions.length > 0 ||
+        specialRes.lightnings.length > 0 ||
+        specialRes.triggeredCount >= 2
+      ) {
+        triggerImpact('special');
+      }
+      updateHighScoreIfNeeded(state);
+    },
+    [triggerImpact, updateHighScoreIfNeeded]
+  );
+
+  const startColumnCascadeOrSpawn = useCallback(
+    (state: EngineState, depth = 0) => {
+      const collapse = collapseBoardColumns(state.board);
+      if (collapse.movedBlocks.length > 0) {
+        state.board = collapse.staticBoard;
+        const movedSpecialCells = collapse.movedBlocks
+          .filter((b) => b.cell.attr !== 'normal')
+          .map((b) => ({
+            x: b.x,
+            y: b.toY,
+            attr: b.cell.attr as SpecialAttribute,
+          }));
+        state.pendingCascade = {
+          settledBoard: collapse.settledBoard,
+          movedSpecialCells,
+          elapsedMs: 0,
+          durationMs: collapse.durationMs,
+          depth,
+        };
+        fxIdRef.current += 1;
+        setCascadeFallFx({
+          id: fxIdRef.current,
+          blocks: collapse.movedBlocks,
+          durationMs: collapse.durationMs,
+        });
+        return;
+      }
+      spawnNextPiece(state);
+    },
+    [spawnNextPiece]
+  );
+
+  const finishPendingCascade = useCallback(
+    (state: EngineState) => {
+      const pending = state.pendingCascade;
+      if (!pending) return;
+
+      state.pendingCascade = null;
+      state.board = pending.settledBoard;
+      setCascadeFallFx(null);
+      soundEngine.cascadeLand();
+
+      if (pending.depth < 10) {
+        const cascadeClearedRows: number[] = [];
+        for (let r = 0; r < pending.settledBoard.length; r++) {
+          if (pending.settledBoard[r].every((cell) => cell !== null)) {
+            cascadeClearedRows.push(r);
+          }
+        }
+
+        const cascadeSpecialRes = state.attributeMode
+          ? resolveSpecialEffects(
+              pending.settledBoard,
+              pending.movedSpecialCells,
+              cascadeClearedRows,
+              state.level
+            )
+          : null;
+
+        const hasSpecial = !!(cascadeSpecialRes && cascadeSpecialRes.triggeredCount > 0);
+        if (hasSpecial && cascadeSpecialRes) {
+          applySpecialResult(state, cascadeSpecialRes);
+        }
+
+        if (cascadeClearedRows.length > 0) {
+          const nextCombo = state.combo + 1;
+          const scoring = calculateLineScore({
+            linesCleared: cascadeClearedRows.length,
+            level: state.level,
+            tSpin: 'NONE',
+            combo: nextCombo,
+            isBackToBack: state.isBackToBack,
+          });
+          state.score += scoring.points;
+          state.lines += cascadeClearedRows.length;
+          state.combo = nextCombo;
+          state.isBackToBack = scoring.qualifiesBackToBack;
+
+          const targetLevel = Math.max(
+            state.startLevel,
+            state.startLevel + Math.floor(state.lines / 10)
+          );
+          const leveledUp = targetLevel > state.level;
+          state.level = targetLevel;
+
+          const baseLabel = `連鎖 · ${scoring.label}`;
+          state.calloutText =
+            hasSpecial && cascadeSpecialRes
+              ? `${baseLabel} + ${cascadeSpecialRes.label}`
+              : baseLabel;
+          state.calloutPoints =
+            scoring.points + (cascadeSpecialRes ? cascadeSpecialRes.bonusPoints : 0);
+          state.calloutTimer = 1550;
+
+          const sampleRow = pending.settledBoard[cascadeClearedRows[0]];
+          const colors = sampleRow.map((cell) =>
+            cell
+              ? cell.attr !== 'normal'
+                ? ATTRIBUTE_META[cell.attr].accent
+                : PIECE_PALETTE[cell.type].highlight
+              : '#FBBF24'
+          );
+          fxIdRef.current += 1;
+          setLineClearFx({
+            id: fxIdRef.current,
+            rows: cascadeClearedRows,
+            colors,
+          });
+
+          if (cascadeClearedRows.length >= 4) {
+            triggerImpact('tetris');
+          }
+          updateHighScoreIfNeeded(state);
+          soundEngine.clearLines(cascadeClearedRows.length, nextCombo, false);
+          if (leveledUp) {
+            setTimeout(() => soundEngine.levelUp(), 180);
+          }
+
+          state.clearingRows = cascadeClearedRows;
+          state.clearFlashTimer = LINE_CLEAR_FLASH_MS;
+          state.needsCascadeAfterClear = hasSpecial;
+          return;
+        }
+
+        if (hasSpecial && cascadeSpecialRes) {
+          state.calloutText = `連鎖反應 · ${cascadeSpecialRes.label}`;
+          state.calloutPoints = cascadeSpecialRes.bonusPoints;
+          state.calloutTimer = 1450;
+          startColumnCascadeOrSpawn(state, pending.depth + 1);
+          return;
+        }
+      }
+
+      spawnNextPiece(state);
+    },
+    [
+      applySpecialResult,
+      spawnNextPiece,
+      startColumnCascadeOrSpawn,
+      triggerImpact,
+      updateHighScoreIfNeeded,
+    ]
+  );
+
   const lockActivePiece = useCallback(
     (state: EngineState) => {
       if (!state.activePiece) return;
@@ -436,10 +680,12 @@ export default function App() {
         state.lastKickIndex
       );
 
-      const { nextBoard, clearedRows, lockedAboveVisible } = lockPieceToBoard(
-        state.board,
-        state.activePiece
-      );
+      const {
+        nextBoard,
+        clearedRows,
+        lockedAboveVisible,
+        newlyLockedSpecialCells,
+      } = lockPieceToBoard(state.board, state.activePiece);
 
       state.board = nextBoard;
       state.activePiece = null;
@@ -454,6 +700,24 @@ export default function App() {
         soundEngine.gameOver();
         triggerImpact('gameover');
         return;
+      }
+
+      if (tSpin !== 'NONE') {
+        state.tSpinCount += 1;
+      }
+
+      const specialRes = state.attributeMode
+        ? resolveSpecialEffects(
+            nextBoard,
+            newlyLockedSpecialCells,
+            clearedRows,
+            state.level
+          )
+        : null;
+
+      const hasSpecial = !!(specialRes && specialRes.triggeredCount > 0);
+      if (hasSpecial && specialRes) {
+        applySpecialResult(state, specialRes);
       }
 
       if (clearedRows.length > 0) {
@@ -478,15 +742,23 @@ export default function App() {
         const leveledUp = targetLevel > state.level;
         state.level = targetLevel;
 
-        state.calloutText =
+        const baseLabel =
           nextCombo > 0 ? `${scoring.label} · 連擊 x${nextCombo}` : scoring.label;
-        state.calloutPoints = scoring.points;
-        state.calloutTimer = 1400;
+        state.calloutText =
+          hasSpecial && specialRes
+            ? `${baseLabel} + ${specialRes.label}`
+            : baseLabel;
+        state.calloutPoints =
+          scoring.points + (specialRes ? specialRes.bonusPoints : 0);
+        state.calloutTimer = 1550;
 
-        // Emit particle burst colors from the first cleared row
         const sampleRow = nextBoard[clearedRows[0]];
         const colors = sampleRow.map((cell) =>
-          cell ? PIECE_PALETTE[cell].highlight : '#FBBF24'
+          cell
+            ? cell.attr !== 'normal'
+              ? ATTRIBUTE_META[cell.attr].accent
+              : PIECE_PALETTE[cell.type].highlight
+            : '#FBBF24'
         );
         fxIdRef.current += 1;
         setLineClearFx({
@@ -507,8 +779,11 @@ export default function App() {
 
         state.clearingRows = clearedRows;
         state.clearFlashTimer = LINE_CLEAR_FLASH_MS;
+        state.needsCascadeAfterClear = hasSpecial;
       } else {
         state.combo = -1;
+        let tSpinPts = 0;
+        let tSpinLabel = '';
         if (tSpin !== 'NONE') {
           const scoring = calculateLineScore({
             linesCleared: 0,
@@ -517,26 +792,49 @@ export default function App() {
             combo: 0,
             isBackToBack: state.isBackToBack,
           });
+          tSpinPts = scoring.points;
+          tSpinLabel = scoring.label;
           state.score += scoring.points;
-          state.calloutText = scoring.label;
-          state.calloutPoints = scoring.points;
-          state.calloutTimer = 1100;
           updateHighScoreIfNeeded(state);
+        }
+
+        if (hasSpecial && specialRes) {
+          state.calloutText = tSpinLabel
+            ? `${tSpinLabel} + ${specialRes.label}`
+            : specialRes.label;
+          state.calloutPoints = tSpinPts + specialRes.bonusPoints;
+          state.calloutTimer = 1450;
+          startColumnCascadeOrSpawn(state, 0);
+          return;
+        }
+
+        if (tSpinLabel) {
+          state.calloutText = tSpinLabel;
+          state.calloutPoints = tSpinPts;
+          state.calloutTimer = 1100;
         }
         soundEngine.lock();
         spawnNextPiece(state);
       }
     },
-    [spawnNextPiece, updateHighScoreIfNeeded]
+    [
+      applySpecialResult,
+      spawnNextPiece,
+      startColumnCascadeOrSpawn,
+      triggerImpact,
+      updateHighScoreIfNeeded,
+    ]
   );
 
   const startNewGame = useCallback(
-    (selectedStartLevel?: number) => {
+    (selectedStartLevel?: number, selectedAttributeMode?: boolean) => {
       const prev = engineRef.current;
       const startLv = selectedStartLevel ?? prev.startLevel;
-      const fresh = createInitialEngineState(startLv);
+      const attrMode = selectedAttributeMode ?? prev.attributeMode;
+      const fresh = createInitialEngineState(startLv, attrMode);
       fresh.status = 'PLAYING';
       fresh.highScore = Math.max(prev.highScore, loadHighScore());
+      setCascadeFallFx(null);
       spawnNextPiece(fresh);
       engineRef.current = fresh;
       keyHoldRef.current = {
@@ -576,6 +874,18 @@ export default function App() {
       state.startLevel = lvl;
       if (state.status === 'TITLE_MENU') {
         state.level = lvl;
+      }
+      syncUi();
+    },
+    [syncUi]
+  );
+
+  const setAttributeMode = useCallback(
+    (enabled: boolean) => {
+      const state = engineRef.current;
+      state.attributeMode = enabled;
+      if (state.status === 'TITLE_MENU') {
+        state.queue = ensureQueue([], enabled);
       }
       syncUi();
     },
@@ -727,19 +1037,21 @@ export default function App() {
       return;
     }
 
-    const currentType = state.activePiece.type;
+    const currentQueueItem = toQueuePiece(state.activePiece);
     if (state.holdPiece === null) {
-      state.holdPiece = currentType;
+      state.holdPiece = currentQueueItem;
       spawnNextPiece(state);
     } else {
-      const swappedType = state.holdPiece;
-      state.holdPiece = currentType;
-      const spawned = createSpawnPiece(swappedType);
+      const swappedItem = state.holdPiece;
+      state.holdPiece = currentQueueItem;
+      const spawned = createSpawnPiece(swappedItem);
       if (!isValidPosition(state.board, spawned)) {
         state.activePiece = null;
         state.status = 'GAME_OVER';
         updateHighScoreIfNeeded(state);
+        soundEngine.setGameActive(false);
         soundEngine.gameOver();
+        triggerImpact('gameover');
       } else {
         state.activePiece = spawned;
         state.gravityTimer = 0;
@@ -755,7 +1067,7 @@ export default function App() {
     state.canHold = false;
     soundEngine.hold();
     syncUi();
-  }, [spawnNextPiece, syncUi, updateHighScoreIfNeeded]);
+  }, [spawnNextPiece, syncUi, triggerImpact, updateHighScoreIfNeeded]);
 
   // Main 60fps requestAnimationFrame loop
   useEffect(() => {
@@ -779,13 +1091,35 @@ export default function App() {
       }
 
       if (state.status === 'PLAYING') {
+        state.elapsedMs += dt;
+
+        if (state.freezeRemainingMs > 0) {
+          const prevTick = Math.ceil(state.freezeRemainingMs / 100);
+          state.freezeRemainingMs = Math.max(0, state.freezeRemainingMs - dt);
+          const nextTick = Math.ceil(state.freezeRemainingMs / 100);
+          if (prevTick !== nextTick) {
+            dirty = true;
+          }
+        }
+
         if (state.clearingRows.length > 0) {
           state.clearFlashTimer -= dt;
           if (state.clearFlashTimer <= 0) {
             state.board = removeClearedRows(state.board, state.clearingRows);
             state.clearingRows = [];
             state.clearFlashTimer = 0;
-            spawnNextPiece(state);
+            if (state.needsCascadeAfterClear) {
+              state.needsCascadeAfterClear = false;
+              startColumnCascadeOrSpawn(state, 0);
+            } else {
+              spawnNextPiece(state);
+            }
+            dirty = true;
+          }
+        } else if (state.pendingCascade) {
+          state.pendingCascade.elapsedMs += dt;
+          if (state.pendingCascade.elapsedMs >= state.pendingCascade.durationMs) {
+            finishPendingCascade(state);
             dirty = true;
           }
         } else if (state.activePiece) {
@@ -810,41 +1144,44 @@ export default function App() {
             }
           }
 
-          const gravityMs = getGravityMs(state.level);
-          state.gravityTimer += dt;
-          if (state.gravityTimer >= gravityMs) {
-            state.gravityTimer -= gravityMs;
-            const nextPos: ActivePiece = {
-              ...state.activePiece,
-              y: state.activePiece.y + 1,
-            };
-            if (isValidPosition(state.board, nextPos)) {
-              state.activePiece = nextPos;
-              state.lastActionWasRotate = false;
-              state.isGrounded = !isValidPosition(state.board, {
-                ...nextPos,
-                y: nextPos.y + 1,
-              });
-              dirty = true;
-            } else {
-              state.isGrounded = true;
-            }
-          }
-
-          if (state.isGrounded && state.activePiece) {
-            const stillGrounded = !isValidPosition(state.board, {
-              ...state.activePiece,
-              y: state.activePiece.y + 1,
-            });
-            if (stillGrounded) {
-              state.lockTimer += dt;
-              if (state.lockTimer >= LOCK_DELAY_MS) {
-                lockActivePiece(state);
+          // Gravity is paused while Frost Freeze is active!
+          if (state.freezeRemainingMs <= 0) {
+            const gravityMs = getGravityMs(state.level);
+            state.gravityTimer += dt;
+            if (state.gravityTimer >= gravityMs) {
+              state.gravityTimer -= gravityMs;
+              const nextPos: ActivePiece = {
+                ...state.activePiece,
+                y: state.activePiece.y + 1,
+              };
+              if (isValidPosition(state.board, nextPos)) {
+                state.activePiece = nextPos;
+                state.lastActionWasRotate = false;
+                state.isGrounded = !isValidPosition(state.board, {
+                  ...nextPos,
+                  y: nextPos.y + 1,
+                });
                 dirty = true;
+              } else {
+                state.isGrounded = true;
               }
-            } else {
-              state.isGrounded = false;
-              state.lockTimer = 0;
+            }
+
+            if (state.isGrounded && state.activePiece) {
+              const stillGrounded = !isValidPosition(state.board, {
+                ...state.activePiece,
+                y: state.activePiece.y + 1,
+              });
+              if (stillGrounded) {
+                state.lockTimer += dt;
+                if (state.lockTimer >= LOCK_DELAY_MS) {
+                  lockActivePiece(state);
+                  dirty = true;
+                }
+              } else {
+                state.isGrounded = false;
+                state.lockTimer = 0;
+              }
             }
           }
         }
@@ -859,7 +1196,15 @@ export default function App() {
 
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [lockActivePiece, moveHorizontal, softDropStep, spawnNextPiece, syncUi]);
+  }, [
+    finishPendingCascade,
+    lockActivePiece,
+    moveHorizontal,
+    softDropStep,
+    spawnNextPiece,
+    startColumnCascadeOrSpawn,
+    syncUi,
+  ]);
 
   // Keyboard bindings
   useEffect(() => {
@@ -1006,13 +1351,13 @@ export default function App() {
     <div className="relative h-dvh w-screen overflow-hidden text-slate-100 flex flex-col bg-[#090B10]">
       <SeasonBackdrop season={currentSeason.id} />
 
-      {/* Top Bar Contract: translucent glass blended into seasonal sky */}
+      {/* Top Bar: Borderless gradient sky fade blended seamlessly into active season */}
       {!isFullscreen ? (
-        <header className="relative z-10 w-full shrink-0 border-b border-white/10 bg-[#0B0E15]/32 backdrop-blur-md">
+        <header className="relative z-10 w-full shrink-0 bg-gradient-to-b from-black/44 via-black/14 to-transparent">
           <div className="w-full max-w-6xl mx-auto px-4 sm:px-6 h-12 flex items-center justify-between gap-4">
-            <div className="flex items-center gap-2.5 shrink-0">
+            <div className="flex items-center gap-2.5 shrink-0 drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)]">
               <TetrominoMark className="w-5 h-5" />
-              <span className="text-base sm:text-lg font-bold tracking-tight text-slate-50 drop-shadow-sm whitespace-nowrap">
+              <span className="text-base sm:text-lg font-bold tracking-tight text-slate-50 whitespace-nowrap">
                 俄羅斯方塊
               </span>
             </div>
@@ -1023,7 +1368,7 @@ export default function App() {
                 onClick={cycleSeason}
                 title="切換季節背景"
                 aria-label={`目前季節：${currentSeason.label}，點擊切換下一個季節`}
-                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-white/10 hover:bg-white/18 border border-white/15 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-black/24 hover:bg-black/40 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
               >
                 {renderSeasonIcon(currentSeason.id)}
                 <span>{currentSeason.label}</span>
@@ -1033,10 +1378,10 @@ export default function App() {
                 type="button"
                 onClick={() => setAutoSeasonCycle((v) => !v)}
                 aria-label={autoSeasonCycle ? '暫停四季自動輪替' : '開啟四季自動輪替'}
-                className={`hidden md:inline-flex items-center px-2.5 py-1.5 text-xs font-medium border rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                className={`hidden md:inline-flex items-center px-2.5 py-1.5 text-xs font-medium rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400 ${
                   autoSeasonCycle
-                    ? 'text-amber-200 bg-amber-400/18 border-amber-300/35 hover:bg-amber-400/25'
-                    : 'text-slate-300 bg-white/8 border-white/12 hover:text-white'
+                    ? `${seasonTheme.accentText} bg-white/14 hover:bg-white/22`
+                    : 'text-slate-300 bg-black/22 hover:text-white hover:bg-black/38'
                 }`}
               >
                 {autoSeasonCycle ? '自動輪替' : '固定季節'}
@@ -1046,10 +1391,10 @@ export default function App() {
                 type="button"
                 onClick={toggleBgm}
                 aria-label={bgmEnabled ? '關閉背景音樂' : '開啟背景音樂'}
-                className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium border rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400 ${
                   bgmEnabled
-                    ? 'text-slate-100 hover:text-white bg-white/10 hover:bg-white/18 border-white/15'
-                    : 'text-slate-400 bg-white/5 border-white/10 hover:text-slate-200'
+                    ? 'text-slate-100 hover:text-white bg-black/24 hover:bg-black/40'
+                    : 'text-slate-400 bg-black/18 hover:text-slate-200'
                 }`}
               >
                 <Music className="w-3.5 h-3.5" />
@@ -1060,7 +1405,7 @@ export default function App() {
                 type="button"
                 onClick={toggleMute}
                 aria-label={muted ? '開啟音效' : '靜音'}
-                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-200 hover:text-white bg-white/10 hover:bg-white/18 border border-white/15 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-200 hover:text-white bg-black/24 hover:bg-black/40 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
               >
                 {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
                 <span className="hidden sm:inline">{muted ? '已靜音' : '音效開'}</span>
@@ -1070,7 +1415,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={togglePause}
-                  className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-white/10 hover:bg-white/18 border border-white/15 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
+                  className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-black/24 hover:bg-black/40 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
                 >
                   {ui.status === 'PAUSED' ? (
                     <>
@@ -1090,7 +1435,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => startNewGame()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 border-b-2 border-amber-600 rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-200"
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-200 ${seasonTheme.buttonBg} ${seasonTheme.buttonText}`}
                 >
                   <RotateCcw className="w-3.5 h-3.5" />
                   <span>重新開始</span>
@@ -1101,7 +1446,7 @@ export default function App() {
                 type="button"
                 onClick={toggleFullscreen}
                 aria-label="進入全螢幕"
-                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-white/10 hover:bg-white/18 border border-white/15 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
+                className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-100 hover:text-white bg-black/24 hover:bg-black/40 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
               >
                 <Maximize2 className="w-3.5 h-3.5" />
                 <span className="hidden md:inline">全螢幕</span>
@@ -1115,7 +1460,7 @@ export default function App() {
             type="button"
             onClick={cycleSeason}
             aria-label={`切換季節：${currentSeason.label}`}
-            className="inline-flex items-center gap-1.5 px-2.5 h-9 text-xs font-medium text-slate-100 hover:text-white bg-[#0B0E15]/45 hover:bg-[#0B0E15]/65 border border-white/15 rounded-lg backdrop-blur-md transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
+            className="inline-flex items-center gap-1.5 px-2.5 h-9 text-xs font-medium text-slate-100 hover:text-white bg-black/30 hover:bg-black/50 rounded-lg backdrop-blur-md transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
           >
             {renderSeasonIcon(currentSeason.id)}
             <span>{currentSeason.label}</span>
@@ -1125,10 +1470,10 @@ export default function App() {
             type="button"
             onClick={toggleBgm}
             aria-label={bgmEnabled ? '關閉背景音樂' : '開啟背景音樂'}
-            className={`inline-flex items-center justify-center w-9 h-9 border border-white/15 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400 ${
+            className={`inline-flex items-center justify-center w-9 h-9 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400 ${
               bgmEnabled
-                ? 'text-slate-100 bg-[#0B0E15]/45 hover:bg-[#0B0E15]/65'
-                : 'text-slate-400 bg-[#0B0E15]/30'
+                ? 'text-slate-100 bg-black/30 hover:bg-black/50'
+                : 'text-slate-400 bg-black/20'
             }`}
           >
             <Music className="w-4 h-4" />
@@ -1138,7 +1483,7 @@ export default function App() {
             type="button"
             onClick={toggleMute}
             aria-label={muted ? '開啟音效' : '靜音'}
-            className="inline-flex items-center justify-center w-9 h-9 text-slate-200 hover:text-white bg-[#0B0E15]/45 hover:bg-[#0B0E15]/65 border border-white/15 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400"
+            className="inline-flex items-center justify-center w-9 h-9 text-slate-200 hover:text-white bg-black/30 hover:bg-black/50 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400"
           >
             {muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
           </button>
@@ -1148,7 +1493,7 @@ export default function App() {
               type="button"
               onClick={togglePause}
               aria-label={ui.status === 'PAUSED' ? '繼續' : '暫停'}
-              className="inline-flex items-center justify-center w-9 h-9 text-slate-100 hover:text-white bg-[#0B0E15]/45 hover:bg-[#0B0E15]/65 border border-white/15 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400"
+              className="inline-flex items-center justify-center w-9 h-9 text-slate-100 hover:text-white bg-black/30 hover:bg-black/50 rounded-lg backdrop-blur-md transition-colors focus-visible:outline-2 focus-visible:outline-amber-400"
             >
               {ui.status === 'PAUSED' ? (
                 <Play className="w-4 h-4" />
@@ -1162,7 +1507,7 @@ export default function App() {
             type="button"
             onClick={toggleFullscreen}
             aria-label="退出全螢幕"
-            className="inline-flex items-center gap-1.5 px-3 h-9 text-xs font-medium text-slate-100 hover:text-white bg-[#0B0E15]/45 hover:bg-[#0B0E15]/65 border border-white/15 rounded-lg backdrop-blur-md transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
+            className="inline-flex items-center gap-1.5 px-3 h-9 text-xs font-medium text-slate-100 hover:text-white bg-black/30 hover:bg-black/50 rounded-lg backdrop-blur-md transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
           >
             <Minimize2 className="w-3.5 h-3.5" />
             <span>退出全螢幕</span>
@@ -1170,478 +1515,601 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Play Console: Unified Translucent Glass Frame fused with Background */}
+      {/* Main Play Stage: Frameless & Borderless, adaptively dissolved into each season */}
       <main className="relative z-10 flex-1 min-h-0 flex flex-col items-center justify-center px-3 sm:px-6 py-2 sm:py-3">
         <div
           key={impactEffect ? `shake-${impactEffect.id}` : 'shake-idle'}
           className={
             impactEffect?.kind === 'gameover'
               ? 'animate-gameover-shake'
-              : impactEffect?.kind === 'tetris'
+              : impactEffect?.kind === 'tetris' || impactEffect?.kind === 'special'
               ? 'animate-tetris-shake'
               : ''
           }
         >
           <div
-            className="relative flex flex-col items-center bg-[#0B0E16]/36 backdrop-blur-md border border-white/16 border-t-white/25 rounded-2xl p-2.5 sm:p-4 shadow-[0_24px_64px_rgba(0,0,0,0.45)] transition-transform duration-100 ease-out"
+            className="relative flex flex-col items-center transition-transform duration-100 ease-out"
             style={{
               transform: hardDropThump ? 'translateY(3px)' : 'translateY(0)',
             }}
           >
+            {/* Soft borderless ambient seasonal aura behind play console */}
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute -inset-10 rounded-full blur-2xl transition-all duration-[2000ms]"
+              style={{
+                background: `radial-gradient(ellipse at center, ${seasonTheme.accentGlow} 0%, transparent 72%)`,
+              }}
+            />
+
+            {/* Soft borderless radial impact pulse (no rectangular border) */}
             {impactEffect && (
               <div
                 key={`frame-flash-${impactEffect.id}`}
                 aria-hidden="true"
-                className={`pointer-events-none absolute inset-0 rounded-2xl animate-border-flash ${
-                  impactEffect.kind === 'gameover'
-                    ? 'border-2 border-red-400 shadow-[0_0_32px_rgba(248,113,113,0.65),inset_0_0_24px_rgba(248,113,113,0.35)]'
-                    : 'border-2 border-amber-300 shadow-[0_0_36px_rgba(251,191,36,0.75),inset_0_0_24px_rgba(251,191,36,0.35)]'
-                }`}
+                className="pointer-events-none absolute -inset-8 rounded-full blur-2xl animate-border-flash"
+                style={{
+                  background:
+                    impactEffect.kind === 'gameover'
+                      ? 'radial-gradient(ellipse at center, rgba(248,113,113,0.42) 0%, transparent 72%)'
+                      : impactEffect.kind === 'special'
+                      ? 'radial-gradient(ellipse at center, rgba(251,146,60,0.45) 0%, transparent 72%)'
+                      : 'radial-gradient(ellipse at center, rgba(251,191,36,0.45) 0%, transparent 72%)',
+                }}
               />
             )}
-          {/* Integrated Scoreboard INSIDE the Game Frame */}
-          <div className="w-full bg-black/22 border border-white/10 rounded-xl px-3.5 sm:px-4 py-2 mb-2.5 sm:mb-3">
-            <div className="grid grid-cols-4 items-center gap-2 sm:gap-5">
-              <div>
-                <div className="text-[10px] sm:text-[11px] text-slate-300/80">分數</div>
-                <div className="font-mono text-sm sm:text-xl font-bold text-white tabular-nums tracking-tight">
-                  {ui.score.toLocaleString()}
-                </div>
-              </div>
 
-              <div className="text-center">
-                <div className="text-[10px] sm:text-[11px] text-slate-300/80">等級</div>
-                <div className="font-mono text-sm sm:text-xl font-bold text-amber-300 tabular-nums">
-                  {ui.level}
-                </div>
-              </div>
-
-              <div className="text-center">
-                <div className="text-[10px] sm:text-[11px] text-slate-300/80">消除行數</div>
-                <div className="font-mono text-sm sm:text-xl font-bold text-slate-100 tabular-nums">
-                  {ui.lines}
-                </div>
-              </div>
-
-              <div className="text-right">
-                <div className="text-[10px] sm:text-[11px] text-slate-300/80">歷史最高</div>
-                <div className="font-mono text-sm sm:text-xl font-bold text-slate-200 tabular-nums">
-                  {ui.highScore.toLocaleString()}
-                </div>
-              </div>
-            </div>
-
-            {/* Integrated 10-segment level progress bar + active combo/B2B note */}
-            <div className="mt-1.5 flex items-center gap-3">
-              <div className="flex-1 grid grid-cols-10 gap-1">
-                {Array.from({ length: 10 }, (_, idx) => (
-                  <div
-                    key={idx}
-                    className={`h-1 rounded-[2px] transition-colors ${
-                      idx < levelProgress ? 'bg-amber-400' : 'bg-white/12'
-                    }`}
-                  />
-                ))}
-              </div>
-              <span className="font-mono text-[10px] text-slate-300/80 tabular-nums whitespace-nowrap">
-                {ui.isBackToBack && <span className="text-amber-300 mr-1.5">B2B</span>}
-                {ui.combo > 0 && <span className="text-amber-300 mr-1.5">連擊 x{ui.combo}</span>}
-                {levelProgress}/10
-              </span>
-            </div>
-          </div>
-
-          {/* Mobile Compact Hold + Next inside the Game Frame */}
-          <div className="flex sm:hidden items-center justify-between gap-4 w-full bg-black/20 border border-white/10 rounded-xl px-3 py-1.5 mb-2.5">
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] font-medium text-slate-300">暫存</span>
-              <PiecePreview
-                type={ui.holdPiece}
-                width={48}
-                height={32}
-                dimmed={!ui.canHold}
-              />
-            </div>
-
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] font-medium text-slate-300">下一個</span>
-              <PiecePreview
-                type={ui.nextPieces[0] ?? null}
-                width={48}
-                height={32}
-              />
-            </div>
-          </div>
-
-          {/* Unified Playfield Row: Hold | 10x20 Smoked-Glass Board | Next */}
-          <div className="flex items-start justify-center gap-3 sm:gap-4">
-            {/* Left Integrated Compartment: Hold + Toggleable Keyboard Guide */}
-            <div className="hidden sm:flex flex-col gap-3 w-36 md:w-44 shrink-0">
-              <div className="bg-black/22 border border-white/10 rounded-xl p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-slate-200">暫存方塊</span>
-                  <KeyCap>C</KeyCap>
-                </div>
-                <div className="bg-black/25 border border-white/8 rounded-lg py-2 flex items-center justify-center min-h-[68px]">
-                  <PiecePreview
-                    type={ui.holdPiece}
-                    width={108}
-                    height={56}
-                    dimmed={!ui.canHold}
-                  />
-                </div>
-              </div>
-
-              {showControlsHint ? (
-                <div className="hidden lg:block bg-black/22 border border-white/10 rounded-xl p-3">
-                  <div className="flex items-center justify-between mb-2.5">
-                    <h2 className="text-xs font-semibold text-slate-200">鍵盤操作</h2>
-                    <button
-                      type="button"
-                      onClick={toggleControlsHint}
-                      aria-label="隱藏鍵盤操作提示"
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium text-slate-300 hover:text-white bg-white/8 hover:bg-white/14 rounded transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
-                    >
-                      <span>隱藏</span>
-                      <ChevronUp className="w-3 h-3" />
-                    </button>
+            {/* Floating Borderless Scoreboard */}
+            <div className="relative w-full max-w-[540px] px-2 sm:px-4 py-1.5 mb-2 sm:mb-2.5 drop-shadow-[0_2px_10px_rgba(0,0,0,0.85)]">
+              <div className="grid grid-cols-4 items-center gap-2 sm:gap-5">
+                <div>
+                  <div className="text-[10px] sm:text-[11px] text-slate-200/80">分數</div>
+                  <div className="font-mono text-sm sm:text-xl font-bold text-white tabular-nums tracking-tight">
+                    {ui.score.toLocaleString()}
                   </div>
-                  <dl className="space-y-2 text-[11px]">
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>左右移動</dt>
-                      <dd className="flex items-center gap-1">
-                        <KeyCap>←</KeyCap>
-                        <KeyCap>→</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>順時針旋轉</dt>
-                      <dd className="flex items-center gap-1">
-                        <KeyCap>↑</KeyCap>
-                        <KeyCap>X</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>逆時針旋轉</dt>
-                      <dd>
-                        <KeyCap>Z</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>加速下降</dt>
-                      <dd>
-                        <KeyCap>↓</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>瞬間落下</dt>
-                      <dd>
-                        <KeyCap>Space</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>暫存交換</dt>
-                      <dd>
-                        <KeyCap>Shift</KeyCap>
-                      </dd>
-                    </div>
-                    <div className="flex items-center justify-between text-slate-200">
-                      <dt>暫停遊戲</dt>
-                      <dd>
-                        <KeyCap>P</KeyCap>
-                      </dd>
-                    </div>
-                  </dl>
                 </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={toggleControlsHint}
-                  aria-label="顯示鍵盤操作提示"
-                  className="hidden lg:flex w-full items-center justify-between px-3 py-2.5 text-xs font-medium text-slate-200 hover:text-white bg-black/22 hover:bg-black/32 border border-white/10 rounded-xl transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
-                >
-                  <span className="inline-flex items-center gap-1.5">
-                    <Keyboard className="w-3.5 h-3.5 text-slate-300" />
-                    <span>鍵盤操作</span>
-                  </span>
-                  <ChevronDown className="w-3.5 h-3.5 text-slate-300" />
-                </button>
-              )}
+
+                <div className="text-center">
+                  <div className="text-[10px] sm:text-[11px] text-slate-200/80">等級</div>
+                  <div className={`font-mono text-sm sm:text-xl font-bold tabular-nums ${seasonTheme.accentText}`}>
+                    {ui.level}
+                  </div>
+                </div>
+
+                <div className="text-center">
+                  <div className="text-[10px] sm:text-[11px] text-slate-200/80">消除行數</div>
+                  <div className="font-mono text-sm sm:text-xl font-bold text-slate-100 tabular-nums">
+                    {ui.lines}
+                  </div>
+                </div>
+
+                <div className="text-right">
+                  <div className="text-[10px] sm:text-[11px] text-slate-200/80">歷史最高</div>
+                  <div className="font-mono text-sm sm:text-xl font-bold text-slate-100 tabular-nums">
+                    {ui.highScore.toLocaleString()}
+                  </div>
+                </div>
+              </div>
+
+              {/* Integrated 10-segment level progress bar + Freeze / Combo telemetry */}
+              <div className="mt-1.5 flex items-center gap-3">
+                <div className="flex-1 grid grid-cols-10 gap-1">
+                  {Array.from({ length: 10 }, (_, idx) => (
+                    <div
+                      key={idx}
+                      className={`h-1 rounded-[2px] transition-colors ${
+                        ui.freezeRemainingMs > 0
+                          ? 'bg-sky-300'
+                          : idx < levelProgress
+                          ? seasonTheme.accentBg
+                          : 'bg-white/18'
+                      }`}
+                    />
+                  ))}
+                </div>
+                <span className="font-mono text-[10px] text-slate-200/90 tabular-nums whitespace-nowrap">
+                  {ui.freezeRemainingMs > 0 && (
+                    <span className="text-sky-300 font-semibold mr-2">
+                      凍結 {(ui.freezeRemainingMs / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                  {ui.isBackToBack && (
+                    <span className={`${seasonTheme.accentText} mr-1.5`}>B2B</span>
+                  )}
+                  {ui.combo > 0 && (
+                    <span className={`${seasonTheme.accentText} mr-1.5`}>
+                      連擊 x{ui.combo}
+                    </span>
+                  )}
+                  {levelProgress}/10
+                </span>
+              </div>
             </div>
 
-            {/* Center Translucent Smoked-Glass Playfield */}
-            <div
-              className="relative rounded-xl overflow-hidden border border-white/18 shadow-[inset_0_2px_18px_rgba(0,0,0,0.55)]"
-              style={{
-                width: `${boardPixelWidth}px`,
-                height: `${boardPixelHeight}px`,
-              }}
-            >
-              <TetrisBoard
-                board={ui.board}
-                activePiece={ui.activePiece}
-                ghostY={ui.ghostY}
-                clearingRows={ui.clearingRows}
-                cellSize={cellSize}
-                paused={ui.status === 'PAUSED'}
-                hardDropFx={hardDropFx}
-                lineClearFx={lineClearFx}
-              />
-
-              {impactEffect && (
-                <div
-                  key={`board-flash-${impactEffect.id}`}
-                  aria-hidden="true"
-                  className={`pointer-events-none absolute inset-0 rounded-xl animate-border-flash ${
-                    impactEffect.kind === 'gameover'
-                      ? 'border-2 border-red-400 shadow-[inset_0_0_28px_rgba(248,113,113,0.5)]'
-                      : 'border-2 border-amber-300 shadow-[inset_0_0_28px_rgba(251,191,36,0.55)]'
-                  }`}
+            {/* Mobile Floating Compact Hold + Next (no box border) */}
+            <div className="flex sm:hidden items-center justify-between gap-4 w-full px-3 py-1 mb-2 drop-shadow-[0_2px_8px_rgba(0,0,0,0.8)]">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-medium text-slate-200">暫存</span>
+                <PiecePreview
+                  piece={ui.holdPiece}
+                  width={48}
+                  height={32}
+                  dimmed={!ui.canHold}
                 />
-              )}
+              </div>
 
-              {/* Non-blocking line clear / T-Spin callout */}
-              {ui.status === 'PLAYING' && ui.calloutText && (
-                <div
-                  className="pointer-events-none absolute top-4 left-1/2 -translate-x-1/2 bg-[#0B0E16]/70 backdrop-blur-md border border-amber-300/45 rounded-lg px-3.5 py-1.5 text-center shadow-lg whitespace-nowrap"
-                  aria-live="polite"
-                >
-                  <div className="text-xs font-semibold text-amber-300">
-                    {ui.calloutText}
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-medium text-slate-200">下一個</span>
+                <PiecePreview
+                  piece={ui.nextPieces[0] ?? null}
+                  width={48}
+                  height={32}
+                />
+              </div>
+            </div>
+
+            {/* Frameless Playfield Row: Floating Left HUD | Feathered Playfield | Floating Right HUD */}
+            <div className="relative flex items-start justify-center gap-4 sm:gap-7">
+              {/* Left Floating Zone: Hold + Toggleable Keyboard Guide */}
+              <div className="hidden sm:flex flex-col gap-5 w-36 md:w-44 shrink-0 pt-2 drop-shadow-[0_2px_10px_rgba(0,0,0,0.85)]">
+                <div className="px-1.5 py-1">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className={`text-xs font-semibold ${seasonTheme.accentText}`}>
+                      暫存方塊
+                    </span>
+                    <KeyCap>C</KeyCap>
                   </div>
-                  <div className="font-mono text-[11px] font-bold text-slate-100 tabular-nums">
-                    +{ui.calloutPoints}
+                  <div className="py-2 flex items-center justify-center min-h-[64px]">
+                    <PiecePreview
+                      piece={ui.holdPiece}
+                      width={108}
+                      height={56}
+                      dimmed={!ui.canHold}
+                    />
                   </div>
                 </div>
-              )}
 
-              {/* TITLE MENU OVERLAY (Translucent Glass fused with Season Backdrop) */}
-              {ui.status === 'TITLE_MENU' && (
-                <div className="absolute inset-0 bg-[#090C14]/56 backdrop-blur-md flex flex-col items-center justify-center p-5 text-center">
-                  <div className="mb-3.5 p-3 bg-white/10 border border-white/15 rounded-2xl shadow-lg">
-                    <TetrominoMark className="w-9 h-9" />
-                  </div>
-
-                  <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white drop-shadow mb-1.5">
-                    俄羅斯方塊
-                  </h1>
-                  <p className="text-xs sm:text-sm text-slate-200/85 mb-5 max-w-[235px] leading-relaxed">
-                    四季景緻相伴，體驗流暢 SRS 旋轉與立體方塊打擊感。
-                  </p>
-
-                  <div className="w-full max-w-[228px] mb-5">
-                    <div className="text-xs font-medium text-slate-200/90 mb-2">
-                      選擇起始等級
+                {showControlsHint ? (
+                  <div className="hidden lg:block px-1.5 py-1">
+                    <div className="flex items-center justify-between mb-2.5">
+                      <h2 className={`text-xs font-semibold ${seasonTheme.accentText}`}>
+                        鍵盤操作
+                      </h2>
+                      <button
+                        type="button"
+                        onClick={toggleControlsHint}
+                        aria-label="隱藏鍵盤操作提示"
+                        className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium text-slate-200 hover:text-white bg-black/28 hover:bg-black/45 rounded transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-amber-400"
+                      >
+                        <span>隱藏</span>
+                        <ChevronUp className="w-3 h-3" />
+                      </button>
                     </div>
-                    <div className="grid grid-cols-3 gap-1.5 p-1 bg-black/30 border border-white/12 rounded-xl">
-                      {[
-                        { lv: 1, label: '標準 · 1' },
-                        { lv: 5, label: '進階 · 5' },
-                        { lv: 10, label: '高手 · 10' },
-                      ].map(({ lv, label }) => (
+                    <dl className="space-y-2 text-[11px]">
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>左右移動</dt>
+                        <dd className="flex items-center gap-1">
+                          <KeyCap>←</KeyCap>
+                          <KeyCap>→</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>順時針旋轉</dt>
+                        <dd className="flex items-center gap-1">
+                          <KeyCap>↑</KeyCap>
+                          <KeyCap>X</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>逆時針旋轉</dt>
+                        <dd>
+                          <KeyCap>Z</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>加速下降</dt>
+                        <dd>
+                          <KeyCap>↓</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>瞬間落下</dt>
+                        <dd>
+                          <KeyCap>Space</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>暫存交換</dt>
+                        <dd>
+                          <KeyCap>Shift</KeyCap>
+                        </dd>
+                      </div>
+                      <div className="flex items-center justify-between text-slate-100">
+                        <dt>暫停遊戲</dt>
+                        <dd>
+                          <KeyCap>P</KeyCap>
+                        </dd>
+                      </div>
+                    </dl>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={toggleControlsHint}
+                    aria-label="顯示鍵盤操作提示"
+                    className="hidden lg:flex w-full items-center justify-between px-2.5 py-2 text-xs font-medium text-slate-100 hover:text-white bg-black/28 hover:bg-black/45 rounded-lg backdrop-blur-sm transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <Keyboard className="w-3.5 h-3.5 text-slate-200" />
+                      <span>鍵盤操作</span>
+                    </span>
+                    <ChevronDown className="w-3.5 h-3.5 text-slate-200" />
+                  </button>
+                )}
+              </div>
+
+              {/* Center Borderless Feathered Playfield (melts seamlessly into seasonal scenery) */}
+              <div
+                className={`relative transition-all duration-300 ${
+                  ui.freezeRemainingMs > 0
+                    ? 'drop-shadow-[0_0_24px_rgba(56,189,248,0.4)]'
+                    : ''
+                }`}
+                style={{
+                  width: `${boardPixelWidth}px`,
+                  height: `${boardPixelHeight}px`,
+                }}
+              >
+                <TetrisBoard
+                  board={ui.board}
+                  activePiece={ui.activePiece}
+                  ghostY={ui.ghostY}
+                  clearingRows={ui.clearingRows}
+                  cellSize={cellSize}
+                  paused={ui.status === 'PAUSED'}
+                  season={currentSeason.id}
+                  freezeRemainingMs={ui.freezeRemainingMs}
+                  hardDropFx={hardDropFx}
+                  lineClearFx={lineClearFx}
+                  specialFx={specialFx}
+                  cascadeFallFx={cascadeFallFx}
+                />
+
+                {/* Non-blocking line clear / T-Spin / Special Link callout */}
+                {ui.status === 'PLAYING' && ui.calloutText && (
+                  <div
+                    className="pointer-events-none absolute top-4 left-1/2 -translate-x-1/2 bg-black/55 backdrop-blur-md rounded-xl px-4 py-1.5 text-center shadow-lg whitespace-nowrap"
+                    aria-live="polite"
+                  >
+                    <div className={`text-xs font-semibold ${seasonTheme.accentText}`}>
+                      {ui.calloutText}
+                    </div>
+                    <div className="font-mono text-[11px] font-bold text-slate-100 tabular-nums">
+                      +{ui.calloutPoints}
+                    </div>
+                  </div>
+                )}
+
+                {/* TITLE MENU OVERLAY (Edge-feathered mist blended with Season Backdrop) */}
+                {ui.status === 'TITLE_MENU' && (
+                  <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(8,11,18,0.78)_0%,rgba(8,11,18,0.52)_64%,transparent_100%)] backdrop-blur-[3px] flex flex-col items-center justify-center p-4 sm:p-5 text-center overflow-y-auto">
+                    <div className="mb-3 p-2.5">
+                      <TetrominoMark className="w-9 h-9 drop-shadow-lg" />
+                    </div>
+
+                    <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white drop-shadow mb-1">
+                      俄羅斯方塊
+                    </h1>
+                    <p className="text-xs sm:text-sm text-slate-100/90 mb-4 max-w-[248px] leading-relaxed drop-shadow">
+                      屬性方塊重合共鳴，觸發爆破、凍結與雷電連鎖消除。
+                    </p>
+
+                    <div className="w-full max-w-[236px] mb-3.5">
+                      <div className="text-xs font-medium text-slate-200/90 mb-1.5">
+                        玩法模式
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 p-1 bg-black/35 rounded-xl">
                         <button
-                          key={lv}
                           type="button"
-                          onClick={() => setStartLevel(lv)}
-                          className={`py-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 ${
-                            ui.startLevel === lv
-                              ? 'bg-amber-400 text-slate-950 font-semibold shadow-sm'
+                          onClick={() => setAttributeMode(true)}
+                          className={`py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                            ui.attributeMode
+                              ? `${seasonTheme.buttonBg} ${seasonTheme.buttonText} font-semibold shadow-sm`
                               : 'text-slate-200 hover:text-white hover:bg-white/10'
                           }`}
                         >
-                          {label}
+                          屬性連結
                         </button>
-                      ))}
+                        <button
+                          type="button"
+                          onClick={() => setAttributeMode(false)}
+                          className={`py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                            !ui.attributeMode
+                              ? `${seasonTheme.buttonBg} ${seasonTheme.buttonText} font-semibold shadow-sm`
+                              : 'text-slate-200 hover:text-white hover:bg-white/10'
+                          }`}
+                        >
+                          經典標準
+                        </button>
+                      </div>
                     </div>
-                  </div>
 
-                  <button
-                    type="button"
-                    onClick={() => startNewGame()}
-                    className="w-full max-w-[228px] inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 border-b-2 border-amber-600 rounded-xl transition-all active:translate-y-[1px] whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200"
-                  >
-                    <Play className="w-4 h-4 fill-current" />
-                    <span>開始遊戲</span>
-                  </button>
-
-                  {ui.highScore > 0 && (
-                    <div className="mt-4 text-xs text-slate-200/85">
-                      最高紀錄{' '}
-                      <span className="font-mono font-bold text-white tabular-nums">
-                        {ui.highScore.toLocaleString()}
-                      </span>
+                    <div className="w-full max-w-[236px] mb-4">
+                      <div className="text-xs font-medium text-slate-200/90 mb-1.5">
+                        選擇起始等級
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5 p-1 bg-black/35 rounded-xl">
+                        {[
+                          { lv: 1, label: '標準 · 1' },
+                          { lv: 5, label: '進階 · 5' },
+                          { lv: 10, label: '高手 · 10' },
+                        ].map(({ lv, label }) => (
+                          <button
+                            key={lv}
+                            type="button"
+                            onClick={() => setStartLevel(lv)}
+                            className={`py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                              ui.startLevel === lv
+                                ? `${seasonTheme.buttonBg} ${seasonTheme.buttonText} font-semibold shadow-sm`
+                                : 'text-slate-200 hover:text-white hover:bg-white/10'
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  )}
-                </div>
-              )}
 
-              {/* PAUSED OVERLAY (Translucent Glass) */}
-              {ui.status === 'PAUSED' && (
-                <div className="absolute inset-0 bg-[#090C14]/54 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
-                  <h2 className="text-2xl font-bold text-white mb-1.5">遊戲暫停</h2>
-                  <p className="text-xs text-slate-200/85 mb-6">
-                    按下 P 鍵或點擊下方按鈕恢復對局
-                  </p>
-                  <div className="flex flex-col gap-2.5 w-full max-w-[208px]">
-                    <button
-                      type="button"
-                      onClick={togglePause}
-                      className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 border-b-2 border-amber-600 rounded-xl transition-all whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200"
-                    >
-                      <Play className="w-4 h-4 fill-current" />
-                      <span>繼續遊戲</span>
-                    </button>
                     <button
                       type="button"
                       onClick={() => startNewGame()}
-                      className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-slate-100 bg-white/12 hover:bg-white/20 border border-white/15 rounded-xl transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
+                      className={`w-full max-w-[236px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all active:translate-y-[1px] whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200 ${seasonTheme.buttonBg} ${seasonTheme.buttonText}`}
+                    >
+                      <Play className="w-4 h-4 fill-current" />
+                      <span>開始遊戲</span>
+                    </button>
+
+                    {ui.highScore > 0 && (
+                      <div className="mt-3.5 text-xs text-slate-200/90">
+                        最高紀錄{' '}
+                        <span className="font-mono font-bold text-white tabular-nums">
+                          {ui.highScore.toLocaleString()}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* PAUSED OVERLAY (Edge-feathered mist) */}
+                {ui.status === 'PAUSED' && (
+                  <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(8,11,18,0.78)_0%,rgba(8,11,18,0.52)_64%,transparent_100%)] backdrop-blur-[3px] flex flex-col items-center justify-center p-6 text-center">
+                    <h2 className="text-2xl font-bold text-white mb-1.5">遊戲暫停</h2>
+                    <p className="text-xs text-slate-200/90 mb-6">
+                      按下 P 鍵或點擊下方按鈕恢復對局
+                    </p>
+                    <div className="flex flex-col gap-2.5 w-full max-w-[208px]">
+                      <button
+                        type="button"
+                        onClick={togglePause}
+                        className={`w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200 ${seasonTheme.buttonBg} ${seasonTheme.buttonText}`}
+                      >
+                        <Play className="w-4 h-4 fill-current" />
+                        <span>繼續遊戲</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => startNewGame()}
+                        className="w-full inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-medium text-slate-100 bg-white/14 hover:bg-white/24 rounded-xl transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400"
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                        <span>重新開始</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* GAME OVER OVERLAY (Edge-feathered mist, no box borders) */}
+                {ui.status === 'GAME_OVER' && (
+                  <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(8,11,18,0.84)_0%,rgba(8,11,18,0.62)_66%,transparent_100%)] backdrop-blur-[3px] flex flex-col items-center justify-center p-4 sm:p-5 text-center overflow-y-auto">
+                    <h2 className="text-xl sm:text-2xl font-bold text-white mb-0.5">遊戲結束</h2>
+                    <p className="text-xs text-slate-200/85 mb-4">本局結算成績與對戰統計</p>
+
+                    <div className="w-full max-w-[236px] mb-5 space-y-2 text-xs drop-shadow">
+                      <div className="flex items-center justify-between pb-1.5">
+                        <span className="text-slate-200">最終分數</span>
+                        <span className={`font-mono text-base font-bold tabular-nums ${seasonTheme.accentText}`}>
+                          {ui.score.toLocaleString()}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-300">消除行數</span>
+                        <span className="font-mono font-semibold text-slate-100 tabular-nums">
+                          {ui.lines}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-300">達成等級</span>
+                        <span className="font-mono font-semibold text-slate-100 tabular-nums">
+                          {ui.level}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between pb-1.5">
+                        <span className="text-slate-300">歷史最高</span>
+                        <span className="font-mono font-semibold text-slate-100 tabular-nums">
+                          {ui.highScore.toLocaleString()}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1.5">
+                        <span className="text-slate-300">遊玩總時間</span>
+                        <span className="font-mono font-semibold text-slate-100 tabular-nums">
+                          {formatDuration(ui.elapsedMs)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-300">平均每分鐘 (APM)</span>
+                        <span className="font-mono font-semibold text-sky-300 tabular-nums">
+                          {ui.lines > 0
+                            ? (ui.lines / (Math.max(ui.elapsedMs, 1000) / 60000)).toFixed(1)
+                            : '0.0'}{' '}
+                          行/分
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-300">T-Spin 成功次數</span>
+                        <span className="font-mono font-semibold text-purple-300 tabular-nums">
+                          {ui.tSpinCount} 次
+                        </span>
+                      </div>
+                      {ui.attributeMode && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-300">屬性連結觸發</span>
+                          <span className="font-mono font-semibold text-orange-300 tabular-nums">
+                            {ui.specialTriggerCount} 次
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => startNewGame()}
+                      className={`w-full max-w-[236px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all active:translate-y-[1px] whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200 ${seasonTheme.buttonBg} ${seasonTheme.buttonText}`}
                     >
                       <RotateCcw className="w-4 h-4" />
-                      <span>重新開始</span>
+                      <span>再玩一次</span>
                     </button>
                   </div>
+                )}
+              </div>
+
+              {/* Right Floating Zone: Next Queue + Attribute Effects Legend */}
+              <div className="hidden sm:flex flex-col gap-5 w-36 md:w-44 shrink-0 pt-2 drop-shadow-[0_2px_10px_rgba(0,0,0,0.85)]">
+                <div className="px-1.5 py-1">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className={`text-xs font-semibold ${seasonTheme.accentText}`}>
+                      下一個方塊
+                    </span>
+                  </div>
+                  <div className="py-1.5 flex flex-col gap-2.5 items-center">
+                    {[0, 1, 2].map((idx) => (
+                      <div
+                        key={idx}
+                        className="w-full flex items-center justify-center"
+                      >
+                        <PiecePreview
+                          piece={ui.nextPieces[idx] ?? null}
+                          width={108}
+                          height={idx === 0 ? 54 : 44}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              )}
 
-              {/* GAME OVER OVERLAY (Translucent Glass) */}
-              {ui.status === 'GAME_OVER' && (
-                <div className="absolute inset-0 bg-[#090C14]/62 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
-                  <h2 className="text-2xl font-bold text-white mb-1">遊戲結束</h2>
-                  <p className="text-xs text-slate-200/85 mb-5">本局結算成績</p>
-
-                  <div className="w-full max-w-[220px] bg-black/30 border border-white/15 rounded-xl p-4 mb-5 space-y-2.5 text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-300">最終分數</span>
-                      <span className="font-mono text-base font-bold text-amber-300 tabular-nums">
-                        {ui.score.toLocaleString()}
-                      </span>
+                {ui.attributeMode && (
+                  <div className="hidden lg:block px-1.5 py-1">
+                    <h2 className={`text-xs font-semibold mb-2.5 ${seasonTheme.accentText}`}>
+                      屬性連結效果
+                    </h2>
+                    <div className="space-y-2.5 text-[11px] leading-snug">
+                      <div className="flex items-start gap-2">
+                        <Flame className="w-3.5 h-3.5 text-orange-400 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-medium text-orange-200">烈焰 · 爆破</div>
+                          <div className="text-slate-200/85">引爆 3×3 範圍方塊</div>
+                        </div>
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <Snowflake className="w-3.5 h-3.5 text-sky-300 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-medium text-sky-200">寒冰 · 凍結</div>
+                          <div className="text-slate-200/85">凍結下落重力 6 秒</div>
+                        </div>
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <Zap className="w-3.5 h-3.5 text-yellow-300 shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-medium text-yellow-200">雷電 · 貫穿</div>
+                          <div className="text-slate-200/85">消除整條縱行方塊</div>
+                        </div>
+                      </div>
                     </div>
-                    <div className="h-px bg-white/10" />
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-300">消除行數</span>
-                      <span className="font-mono font-semibold text-slate-100 tabular-nums">
-                        {ui.lines}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-300">達成等級</span>
-                      <span className="font-mono font-semibold text-slate-100 tabular-nums">
-                        {ui.level}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-300">歷史最高</span>
-                      <span className="font-mono font-semibold text-slate-100 tabular-nums">
-                        {ui.highScore.toLocaleString()}
-                      </span>
+                    <div className="mt-2.5 text-[10px] text-slate-200/80 leading-relaxed">
+                      同屬性相連或消行即觸發；異屬性相鄰可建立連結鏈連鎖爆發，剩餘方塊將隨爆破降落。
                     </div>
                   </div>
-
-                  <button
-                    type="button"
-                    onClick={() => startNewGame()}
-                    className="w-full max-w-[220px] inline-flex items-center justify-center gap-2 px-5 py-3 text-sm font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 border-b-2 border-amber-600 rounded-xl transition-all active:translate-y-[1px] whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-200"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                    <span>再玩一次</span>
-                  </button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
-            {/* Right Integrated Compartment: Next Queue */}
-            <div className="hidden sm:flex flex-col gap-3 w-36 md:w-44 shrink-0">
-              <div className="bg-black/22 border border-white/10 rounded-xl p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-semibold text-slate-200">下一個方塊</span>
-                </div>
-                <div className="bg-black/25 border border-white/8 rounded-lg py-2 flex flex-col gap-1.5 items-center">
-                  {[0, 1, 2].map((idx) => (
-                    <div
-                      key={idx}
-                      className={`w-full flex items-center justify-center ${
-                        idx > 0 ? 'pt-1.5 border-t border-white/8' : ''
-                      }`}
-                    >
-                      <PiecePreview
-                        type={ui.nextPieces[idx] ?? null}
-                        width={108}
-                        height={idx === 0 ? 54 : 44}
-                      />
-                    </div>
-                  ))}
-                </div>
+            {/* Borderless Touch Controls for Mobile & Tablet */}
+            <div className="flex lg:hidden flex-col gap-2 w-full max-w-[360px] mt-2.5 select-none">
+              <div className="grid grid-cols-4 gap-2">
+                <button
+                  type="button"
+                  onClick={holdActivePiece}
+                  aria-label="暫存方塊"
+                  className="min-h-[44px] flex items-center justify-center gap-1.5 bg-black/32 active:bg-white/20 rounded-xl text-xs font-medium text-slate-100 backdrop-blur-md"
+                >
+                  <Repeat2 className="w-4 h-4" />
+                  <span>暫存</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => rotateActive(-1)}
+                  aria-label="逆時針旋轉"
+                  className="min-h-[44px] flex items-center justify-center bg-black/32 active:bg-white/20 rounded-xl text-slate-100 backdrop-blur-md"
+                >
+                  <RotateCcw className="w-5 h-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => rotateActive(1)}
+                  aria-label="順時針旋轉"
+                  className="min-h-[44px] flex items-center justify-center bg-black/32 active:bg-white/20 rounded-xl text-slate-100 backdrop-blur-md"
+                >
+                  <RotateCw className="w-5 h-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={hardDrop}
+                  aria-label="瞬間落下"
+                  className={`min-h-[44px] flex items-center justify-center gap-1 rounded-xl text-xs font-semibold backdrop-blur-md ${seasonTheme.buttonBg} ${seasonTheme.buttonText}`}
+                >
+                  <ChevronsDown className="w-4 h-4" />
+                  <span>瞬降</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => moveHorizontal(-1, true)}
+                  aria-label="向左移動"
+                  className="min-h-[46px] flex items-center justify-center bg-black/32 active:bg-white/20 rounded-xl text-slate-100 backdrop-blur-md"
+                >
+                  <ArrowLeft className="w-5 h-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => softDropStep(true)}
+                  aria-label="向下加速"
+                  className="min-h-[46px] flex items-center justify-center bg-black/32 active:bg-white/20 rounded-xl text-slate-100 backdrop-blur-md"
+                >
+                  <ArrowDown className="w-5 h-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => moveHorizontal(1, true)}
+                  aria-label="向右移動"
+                  className="min-h-[46px] flex items-center justify-center bg-black/32 active:bg-white/20 rounded-xl text-slate-100 backdrop-blur-md"
+                >
+                  <ArrowRight className="w-5 h-5" />
+                </button>
               </div>
             </div>
           </div>
-
-          {/* Touch Controls integrated for Mobile & Tablet */}
-          <div className="flex lg:hidden flex-col gap-2 w-full max-w-[360px] mt-2.5 select-none">
-            <div className="grid grid-cols-4 gap-2">
-              <button
-                type="button"
-                onClick={holdActivePiece}
-                aria-label="暫存方塊"
-                className="min-h-[44px] flex items-center justify-center gap-1.5 bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-xs font-medium text-slate-100 backdrop-blur-sm"
-              >
-                <Repeat2 className="w-4 h-4" />
-                <span>暫存</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => rotateActive(-1)}
-                aria-label="逆時針旋轉"
-                className="min-h-[44px] flex items-center justify-center bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-slate-100 backdrop-blur-sm"
-              >
-                <RotateCcw className="w-5 h-5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => rotateActive(1)}
-                aria-label="順時針旋轉"
-                className="min-h-[44px] flex items-center justify-center bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-slate-100 backdrop-blur-sm"
-              >
-                <RotateCw className="w-5 h-5" />
-              </button>
-              <button
-                type="button"
-                onClick={hardDrop}
-                aria-label="瞬間落下"
-                className="min-h-[44px] flex items-center justify-center gap-1 bg-amber-400/25 active:bg-amber-400/40 border border-amber-300/40 rounded-xl text-xs font-semibold text-amber-200 backdrop-blur-sm"
-              >
-                <ChevronsDown className="w-4 h-4" />
-                <span>瞬降</span>
-              </button>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => moveHorizontal(-1, true)}
-                aria-label="向左移動"
-                className="min-h-[46px] flex items-center justify-center bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-slate-100 backdrop-blur-sm"
-              >
-                <ArrowLeft className="w-5 h-5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => softDropStep(true)}
-                aria-label="向下加速"
-                className="min-h-[46px] flex items-center justify-center bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-slate-100 backdrop-blur-sm"
-              >
-                <ArrowDown className="w-5 h-5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => moveHorizontal(1, true)}
-                aria-label="向右移動"
-                className="min-h-[46px] flex items-center justify-center bg-white/10 active:bg-white/20 border border-white/15 rounded-xl text-slate-100 backdrop-blur-sm"
-              >
-                <ArrowRight className="w-5 h-5" />
-              </button>
-            </div>
-          </div>
-        </div>
         </div>
       </main>
     </div>

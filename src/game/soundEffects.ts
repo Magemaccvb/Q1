@@ -283,6 +283,41 @@ class SoundEngine {
     this.playTone(261.63, 0.18, 'sawtooth', 0.055, 196.0, 0.15);
     this.playTone(196.0, 0.34, 'triangle', 0.075, 110.0, 0.31);
   }
+
+  public explode(chainDepth = 0) {
+    const pitchBoost = Math.min(1.25, 1 + chainDepth * 0.08);
+    this.playTone(150 * pitchBoost, 0.22, 'sawtooth', 0.11, 42, 0);
+    this.playTone(95, 0.28, 'sine', 0.13, 34, 0.02);
+    this.playNoiseBurst(0.24, 1400, 0.11);
+  }
+
+  public freeze() {
+    this.playTone(1046.5, 0.14, 'sine', 0.065, 1318.5, 0);
+    this.playTone(1318.5, 0.16, 'sine', 0.06, 1567.98, 0.05);
+    this.playTone(1567.98, 0.26, 'triangle', 0.055, 2093.0, 0.11);
+    this.playNoiseBurst(0.16, 4800, 0.028);
+  }
+
+  public lightning(isCross = false) {
+    this.playTone(980, 0.09, 'sawtooth', 0.075, 220, 0);
+    this.playTone(1480, 0.12, 'triangle', 0.065, 440, 0.03);
+    if (isCross) {
+      this.playTone(1760, 0.16, 'sine', 0.07, 520, 0.06);
+    }
+    this.playNoiseBurst(0.12, 3600, 0.06);
+  }
+
+  public linkChain(chainCount: number) {
+    const ratio = PENTATONIC_RATIOS[Math.min(chainCount, PENTATONIC_RATIOS.length - 1)];
+    const base = 523.25 * Math.min(1.5, ratio);
+    this.playTone(base, 0.11, 'sine', 0.065, base * 1.25, 0);
+    this.playTone(base * 1.5, 0.16, 'triangle', 0.06, base * 2, 0.05);
+  }
+
+  public cascadeLand() {
+    this.playTone(145, 0.075, 'triangle', 0.065, 78, 0);
+    this.playNoiseBurst(0.045, 720, 0.035);
+  }
 }
 
 export const soundEngine = new SoundEngine();

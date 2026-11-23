@@ -1,16 +1,20 @@
 import { useEffect, useRef } from 'react';
-import { TETROMINO_MATRICES, TetrominoType } from '../game/tetrisTypes';
+import {
+  BlockAttribute,
+  QueuePiece,
+  TETROMINO_MATRICES,
+} from '../game/tetrisTypes';
 import { drawTactileBlock } from './blockRenderer';
 
 interface PiecePreviewProps {
-  type: TetrominoType | null;
+  piece: QueuePiece | null;
   width?: number;
   height?: number;
   dimmed?: boolean;
 }
 
 export function PiecePreview({
-  type,
+  piece,
   width = 104,
   height = 68,
   dimmed = false,
@@ -30,9 +34,9 @@ export function PiecePreview({
 
     ctx.clearRect(0, 0, width, height);
 
-    if (!type) return;
+    if (!piece) return;
 
-    const matrix = TETROMINO_MATRICES[type][0];
+    const matrix = TETROMINO_MATRICES[piece.type][0];
     let minR = Infinity;
     let maxR = -Infinity;
     let minC = Infinity;
@@ -62,21 +66,29 @@ export function PiecePreview({
     const offsetX = Math.floor((width - totalW) / 2);
     const offsetY = Math.floor((height - totalH) / 2);
 
-    for (let r = minR; r <= maxR; r++) {
-      for (let c = minC; c <= maxC; c++) {
+    let cellOrder = 0;
+    for (let r = 0; r < matrix.length; r++) {
+      for (let c = 0; c < matrix[r].length; c++) {
         if (matrix[r][c]) {
+          const attr: BlockAttribute =
+            piece.specialAttr && piece.specialCellIndex === cellOrder
+              ? piece.specialAttr
+              : 'normal';
           drawTactileBlock(
             ctx,
             offsetX + (c - minC) * blockSize,
             offsetY + (r - minR) * blockSize,
             blockSize,
-            type,
-            dimmed ? 0.35 : 1
+            piece.type,
+            dimmed ? 0.35 : 1,
+            attr,
+            0.5
           );
+          cellOrder++;
         }
       }
     }
-  }, [type, width, height, dimmed]);
+  }, [piece, width, height, dimmed]);
 
   return (
     <canvas
